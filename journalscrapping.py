@@ -31,7 +31,6 @@ st.set_page_config(
 
 @st.cache_data(ttl=60 * 60)
 def http_get(url: str, params: Optional[dict] = None) -> str:
-    """GET with basic caching and headers."""
     r = requests.get(url, params=params, headers=HEADERS, timeout=20)
     r.raise_for_status()
     return r.text
@@ -48,7 +47,6 @@ def _absolute_url(href: str) -> str:
 # ---------------------------
 
 def _find_results_table(soup: BeautifulSoup):
-    """Look for any table that plausibly contains results (title/journal/source/publication)."""
     candidates = []
     for table in soup.find_all("table"):
         ths = [th.get_text(strip=True).lower() for th in table.find_all("th")]
@@ -59,21 +57,12 @@ def _find_results_table(soup: BeautifulSoup):
 
 
 def _extract_candidates_from_any_markup(soup: BeautifulSoup) -> List[Dict]:
-    """Fallback: scrape journal links even without a recognizable table."""
     items: List[Dict] = []
-
-    # A) links that point to a specific journal SID page
     for a in soup.select('a[href*="journalsearch.php"]'):
         href = a.get("href") or ""
         text = a.get_text(" ", strip=True)
         if "tip=sid" in href and text:
-            items.append({
-                "title": text,
-                "url": _absolute_url(href),
-                "hint": ""
-            })
-
-    # B) any table rows with a link in first cell
+            items.append({"title": text, "url": _absolute_url(href), "hint": ""})
     if not items:
         for table in soup.find_all("table"):
             for row in table.find_all("tr"):
@@ -86,13 +75,7 @@ def _extract_candidates_from_any_markup(soup: BeautifulSoup) -> List[Dict]:
                     continue
                 tds = row.find_all("td")
                 hint = " ".join(td.get_text(" ", strip=True) for td in tds[1:]) if len(tds) > 1 else ""
-                items.append({
-                    "title": title,
-                    "url": _absolute_url(href),
-                    "hint": hint
-                })
-
-    # de-dupe by URL
+                items.append({"title": title, "url": _absolute_url(href), "hint": hint})
     seen = set()
     uniq = []
     for it in items:
@@ -105,10 +88,8 @@ def _extract_candidates_from_any_markup(soup: BeautifulSoup) -> List[Dict]:
 
 @st.cache_data(ttl=60 * 60)
 def sjr_search(query: str) -> List[Dict]:
-    """Search SCImago for journals by name/ISSN and return candidate rows."""
     html = http_get(SEARCH_URL.format(query=ul.quote_plus(query)))
     soup = BeautifulSoup(html, "lxml")
-
     candidates: List[Dict] = []
 
     table = _find_results_table(soup)
@@ -142,7 +123,6 @@ STOPWORDS = {
 }
 
 ABBREV_EXPAND = {
-    # common scholarly abbreviations
     "int": "international",
     "intl": "international",
     "int'l": "international",
@@ -158,7 +138,6 @@ ABBREV_EXPAND = {
     "environ": "environmental",
     "technol": "technology",
     "techn": "technology",
-    # orgs
     "ieee": "institute of electrical and electronics engineers",
     "acm": "association for computing machinery",
     "plos": "public library of science",
@@ -169,7 +148,7 @@ def normalize_text(s: str) -> str:
     if not s:
         return ""
     s = unicodedata.normalize("NFKD", s)
-    s = s.encode("ascii", "ignore").decode("ascii")  # strip diacritics
+    s = s.encode("ascii", "ignore").decode("ascii")
     s = s.lower().strip()
     s = s.replace("&", " and ")
     s = re.sub(r"[/\-_:]+", " ", s)
@@ -217,9 +196,9 @@ def hybrid_score(query: str, title: str) -> float:
     qn, tn = normalize_text(query), normalize_text(title)
     qt, tt = tokens(qn), tokens(tn)
 
-    base = fuzzy_ratio(qn, tn)                    # 0..1
-    jac = jaccard(qt, tt)                         # 0..1
-    cov = token_overlap_score(qt, tt)             # 0..1
+    base = fuzzy_ratio(qn, tn)
+    jac = jaccard(qt, tt)
+    cov = token_overlap_score(qt, tt)
     acr_q = make_acronym(query)
     acr_t = make_acronym(title)
     acr = 1.0 if acr_q and acr_q == acr_t else 0.0
@@ -234,17 +213,14 @@ def generate_query_variants(q: str) -> List[str]:
 
     variants = {q.strip(), qn}
 
-    # remove wrappers
     trimmed = re.sub(r"^(the|journal|journal of)\s+", "", qn)
     if trimmed != qn:
         variants.add(trimmed)
 
-    # stopword-trimmed core
     core = " ".join([t for t in toks if t not in STOPWORDS])
     if core and core != qn:
         variants.add(core)
 
-    # abbreviation expansions
     expanded_tokens = []
     for t in toks:
         expanded_tokens.extend(expand_abbrev(t))
@@ -252,12 +228,10 @@ def generate_query_variants(q: str) -> List[str]:
     if expanded and expanded != qn:
         variants.add(expanded)
 
-    # keep raw acronym if query is all-caps letters
     raw_acr = "".join(ch for ch in q if ch.isalpha())
     if raw_acr.isupper() and len(raw_acr) >= 3:
         variants.add(raw_acr)
 
-    # skim generic qualifiers
     drop_set = {"international", "intl", "letters", "reports", "annals", "bulletin", "transactions", "reviews", "journal"}
     skim = " ".join([t for t in toks if t not in drop_set])
     if skim and skim != qn:
@@ -274,7 +248,6 @@ def generate_query_variants(q: str) -> List[str]:
 
 @st.cache_data(ttl=60 * 60)
 def crossref_journal_lookup(query: str, rows: int = 8) -> List[Dict]:
-    """Query Crossref for journals; return title + ISSN list to retry on SJR."""
     url = f"https://api.crossref.org/journals?query.title={ul.quote_plus(query)}&rows={rows}"
     try:
         r = requests.get(url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=20)
@@ -306,11 +279,9 @@ def _try_sjr_by_issn_list(issns: List[str]) -> List[Dict]:
 
 @st.cache_data(ttl=60 * 60)
 def sjr_search_intelligent(query: str) -> List[Dict]:
-    """Run multiple query variants; if none, use Crossref→ISSN as a fallback. Score & sort results."""
     seen: Dict[str, Dict] = {}
     variants = generate_query_variants(query)
 
-    # 1) SJR with variants
     for v in variants:
         try:
             res = sjr_search(v)
@@ -321,7 +292,6 @@ def sjr_search_intelligent(query: str) -> List[Dict]:
             if key not in seen:
                 seen[key] = r
 
-    # 2) Crossref fallback
     if not seen:
         xrefs = crossref_journal_lookup(query, rows=8)
         issn_pool: List[str] = []
@@ -334,7 +304,6 @@ def sjr_search_intelligent(query: str) -> List[Dict]:
                 if key not in seen:
                     seen[key] = r
 
-    # score & sort
     ranked = []
     for r in seen.values():
         s = hybrid_score(query, r["title"])
@@ -344,7 +313,7 @@ def sjr_search_intelligent(query: str) -> List[Dict]:
 
 
 # ---------------------------
-# Detail page parsing
+# Detail page parsing (now also grabs CiteScore & Cites/Doc 2y)
 # ---------------------------
 
 def _grab_first_number(pattern: str, text: str) -> Optional[str]:
@@ -389,28 +358,25 @@ def sjr_fetch_details(url: str) -> Dict:
     soup = BeautifulSoup(html, "lxml")
     page_text = soup.get_text(" ", strip=True)
 
-    # Journal name
     h1 = soup.find("h1")
     name = h1.get_text(strip=True) if h1 else None
 
-    # H-index
     h_index = _grab_first_number(r"H\s*[- ]?\s*index\s*:?\s*([0-9]{1,4})", page_text)
-
-    # SJR (public indicator; not Clarivate JIF)
     sjr_val = _grab_first_number(r"SJR\s*:?\s*([0-9]+(?:\.[0-9]+)?)", page_text)
 
-    # Best Quartile
+    citescore = _grab_first_number(r"Cite\s*Score\s*:?\s*([0-9]+(?:\.[0-9]+)?)", page_text)
+    cites_per_doc_2y = _grab_first_number(r"Cites\s*/\s*Doc\.?\s*\(\s*2\s*years?\s*\)\s*:?\s*([0-9]+(?:\.[0-9]+)?)", page_text)
+    impact_factor_jif = _grab_first_number(r"Impact\s*Factor\s*:?\s*([0-9]+(?:\.[0-9]+)?)", page_text)
+
     best_quartile = None
     m_bq = re.search(r"Best\s*Quartile\s*:?\s*(Q[1-4])", page_text, flags=re.I)
     if m_bq:
         best_quartile = m_bq.group(1).upper()
 
-    # Highest percentile (from categories)
     highest_pct = _parse_highest_percentile_from_text(page_text)
     if highest_pct is not None:
         highest_pct = int(highest_pct)
 
-    # Publisher / Country / ISSN
     publisher = _grab_first_number(r"Publisher\s*:?\s*(.+?)\s{2,}", page_text)
     country = _grab_first_number(r"Country\s*:?\s*([A-Za-z \-]+)", page_text)
     issns = re.findall(r"ISSN[^0-9]*([0-9]{4}\-?[0-9Xx]{4})", page_text)
@@ -438,13 +404,16 @@ def sjr_fetch_details(url: str) -> Dict:
         "journal_name": name,
         "h_index": int(h_index) if h_index else None,
         "sjr": float(sjr_val) if sjr_val else None,
+        "citescore": float(citescore) if citescore else None,
+        "cites_per_doc_2y": float(cites_per_doc_2y) if cites_per_doc_2y else None,
+        "impact_factor_jif": float(impact_factor_jif) if impact_factor_jif else None,
         "best_quartile": best_quartile,
         "highest_percentile": highest_pct,
         "publisher": publisher,
         "country": country,
         "issn_list": issns,
         "categories": categories,
-        "links": links
+        "links": links,
     }
     return detail
 
@@ -452,7 +421,7 @@ def sjr_fetch_details(url: str) -> Dict:
 def row_from_detail(d: Dict) -> Dict:
     impact_str = "N/A"
     if d.get("sjr") is not None:
-        impact_str = f"SJR {d['sjr']:.3f}"  # clearly labeled proxy
+        impact_str = f"SJR {d['sjr']:.3f}"
 
     details = {
         "Best quartile": d.get("best_quartile"),
@@ -466,10 +435,10 @@ def row_from_detail(d: Dict) -> Dict:
     return {
         "Journal name": d.get("journal_name") or "",
         "Highest percentile": d.get("highest_percentile"),
-        "Impact factor": impact_str,  # proxy label
+        "Impact factor": impact_str,  # SJR proxy for display
         "H-index": d.get("h_index"),
         "Details": details_str,
-        "Links": json.dumps(d.get("links") or {})  # keep raw dict for download; hidden in table
+        "Links": json.dumps(d.get("links") or {})
     }
 
 
@@ -479,8 +448,8 @@ def row_from_detail(d: Dict) -> Dict:
 
 st.title("📚 Journal Metrics Finder")
 st.caption(
-    "Search a publication journal by name and view **Highest percentile (SJR)**, **Impact (SJR proxy)**, **H-index**, and details. "
-    "Clarivate’s JIF is not scraped; the 'Impact factor' column uses **SJR** when JIF isn’t publicly available."
+    "Search a publication journal by name and view **Highest percentile (SJR)**, **CiteScore/Cites·Doc(2y)**, **Impact (SJR)**, **H-index**, and details. "
+    "Clarivate’s JIF is not scraped; if a page explicitly mentions it we will try to parse it."
 )
 
 with st.sidebar:
@@ -493,20 +462,22 @@ with st.sidebar:
     st.header("About")
     st.write(
         "- Data source: **SCImago Journal & Country Rank (SJR)** public pages.\n"
-        "- H-index and category percentiles are parsed from the journal’s SJR page.\n"
-        "- 'Impact factor' shown here = **SJR** proxy, *not* Clarivate JIF."
+        "- H-index, percentile, and SJR are parsed from each journal’s SJR page.\n"
+        "- 'Impact factor' shown in tables = **SJR** unless a page explicitly shows Clarivate JIF.\n"
+        "- 'CiteScore' column shows Elsevier **CiteScore** if present on the page; otherwise we show **Cites/Doc (2y)** from SJR."
     )
-    st.markdown("---")
-    st.write("Tip: If the journal has many similar names, pick the exact one from the list.")
 
 query = st.text_input("🔎 Enter journal name (ISSN or title)", placeholder="e.g., Nature, PLOS ONE, Malaria Journal")
 max_candidates = st.slider("Max results to list", 1, 50, 12)
+
+show_metrics = st.checkbox("Show percentile, CiteScore, Impact (SJR), H-index in results", value=True)
+metrics_top_n = st.slider("Fetch metrics for top N results", 1, max_candidates, min(5, max_candidates))
 
 search_col1, search_col2 = st.columns([1, 3])
 with search_col1:
     do_search = st.button("Search", type="primary")
 with search_col2:
-    export_btn = st.empty()
+    export_placeholder = st.empty()
 
 results_df = pd.DataFrame()
 
@@ -528,22 +499,45 @@ if do_search and query.strip():
                 if top["score"] >= 0.75:
                     st.info(f"**Did you mean:** {top['title']}  \nConfidence: {top['score']:.2%}")
 
-                cdf = pd.DataFrame([
-                    {
+                rows = []
+                limit = min(len(ranked), max_candidates)
+                progress = st.progress(0) if show_metrics else None
+                for i in range(limit):
+                    r = ranked[i]
+                    row = {
                         "Title": r["title"],
                         "Hint": r.get("hint", ""),
                         "Confidence": f"{r['score']:.2%}",
                         "Acronym": r.get("acronym", ""),
+                        "Percentile": None,
+                        "CiteScore / Cites/Doc(2y)": None,
+                        "Impact (SJR)": None,
+                        "H-index": None,
                         "URL": r["url"],
                     }
-                    for r in ranked[:max_candidates]
-                ])
+                    if show_metrics and i < metrics_top_n:
+                        try:
+                            d = sjr_fetch_details(r["url"])
+                            cs = d.get("citescore") if d.get("citescore") is not None else d.get("cites_per_doc_2y")
+                            row.update({
+                                "Percentile": d.get("highest_percentile"),
+                                "CiteScore / Cites/Doc(2y)": cs,
+                                "Impact (SJR)": d.get("sjr"),
+                                "H-index": d.get("h_index"),
+                            })
+                        except Exception:
+                            pass
+                    rows.append(row)
+                    if progress:
+                        progress.progress((i + 1) / limit)
+
+                cdf = pd.DataFrame(rows)
                 st.subheader("Search results")
                 st.dataframe(cdf.drop(columns=["URL"]), use_container_width=True)
 
                 pick = st.selectbox(
                     "Choose a journal to fetch metrics",
-                    options=list(range(min(len(ranked), max_candidates))),
+                    options=list(range(limit)),
                     format_func=lambda i: ranked[i]["title"],
                 )
                 chosen = ranked[pick]
@@ -569,13 +563,43 @@ if do_search and query.strip():
             if not candidates:
                 st.warning("No results found. Try a different or shorter name.")
             else:
-                cdf = pd.DataFrame([{ "Title": c["title"], "Hint": c["hint"], "URL": c["url"] } for c in candidates])
+                rows = []
+                limit = min(len(candidates), max_candidates)
+                progress = st.progress(0) if show_metrics else None
+                for i in range(limit):
+                    c = candidates[i]
+                    row = {
+                        "Title": c["title"],
+                        "Hint": c.get("hint", ""),
+                        "Percentile": None,
+                        "CiteScore / Cites/Doc(2y)": None,
+                        "Impact (SJR)": None,
+                        "H-index": None,
+                        "URL": c["url"],
+                    }
+                    if show_metrics and i < metrics_top_n:
+                        try:
+                            d = sjr_fetch_details(c["url"])
+                            cs = d.get("citescore") if d.get("citescore") is not None else d.get("cites_per_doc_2y")
+                            row.update({
+                                "Percentile": d.get("highest_percentile"),
+                                "CiteScore / Cites/Doc(2y)": cs,
+                                "Impact (SJR)": d.get("sjr"),
+                                "H-index": d.get("h_index"),
+                            })
+                        except Exception:
+                            pass
+                    rows.append(row)
+                    if progress:
+                        progress.progress((i + 1) / limit)
+
+                cdf = pd.DataFrame(rows)
                 st.subheader("Search results")
                 st.dataframe(cdf.drop(columns=["URL"]), use_container_width=True)
 
                 pick = st.selectbox(
                     "Choose a journal to fetch metrics",
-                    options=list(range(len(candidates))),
+                    options=list(range(limit)),
                     format_func=lambda i: candidates[i]["title"],
                 )
                 chosen = candidates[pick]
@@ -631,7 +655,6 @@ if not results_df.empty:
 
 st.markdown("---")
 st.caption(
-    "Educational use only. Respect site Terms of Service. For official Journal Impact Factor (JIF), "
-    "please consult **Journal Citation Reports (Clarivate)**."
+    "Educational use only. Respect site Terms of Service. For official Journal Impact Factor (JIF), please consult **Journal Citation Reports (Clarivate)**.\n"
+    "Where a page explicitly shows JIF text, we surface it; otherwise 'Impact (SJR)' is shown."
 )
-
