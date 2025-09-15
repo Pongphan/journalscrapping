@@ -1,8 +1,10 @@
 import re
-import time
 import json
+import math
+import unicodedata
 import urllib.parse as ul
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
+from difflib import SequenceMatcher
 
 import requests
 import pandas as pd
@@ -25,7 +27,7 @@ st.set_page_config(
 )
 
 # ---------------------------
-# Helpers
+# Helpers (HTTP)
 # ---------------------------
 
 @st.cache_data(ttl=60 * 60)
@@ -47,6 +49,142 @@ def _absolute_url(href: str) -> str:
     if href.startswith("http"):
         return href
     return BASE + "/" + href.lstrip("/")
+
+# ---------------------------
+# Text intelligence helpers
+# ---------------------------
+
+STOPWORDS = {
+    "the","of","and","for","in","on","to","a","an","at","by",
+    "journal","j","rev","reviews","annals","letters","bulletin",
+    "transactions","archives","acta"
+}
+
+ABBREV_EXPAND = {
+    # common scholarly abbreviations
+    "int": "international",
+    "intl": "international",
+    "int'l": "international",
+    "med": "medical",
+    "biol": "biology",
+    "chem": "chemistry",
+    "phys": "physics",
+    "comput": "computing",
+    "comp": "computer",
+    "sci": "science",
+    "eng": "engineering",
+    "env": "environmental",
+    "environ": "environmental",
+    "technol": "technology",
+    "techn": "technology",
+    # well-known orgs
+    "ieee": "institute of electrical and electronics engineers",
+    "acm": "association for computing machinery",
+    "plos": "public library of science",
+}
+
+def normalize_text(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode("ascii")  # strip diacritics
+    s = s.lower().strip()
+    s = s.replace("&", " and ")
+    s = re.sub(r"[/\-_:]+", " ", s)
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+def tokens(text: str) -> List[str]:
+    return [t for t in normalize_text(text).split() if t]
+
+def expand_abbrev(tok: str) -> List[str]:
+    # return [original or expanded]
+    out = [tok]
+    if tok in ABBREV_EXPAND:
+        out.append(ABBREV_EXPAND[tok])
+    return out
+
+def make_acronym(text: str) -> str:
+    toks = [t for t in tokens(text) if t not in STOPWORDS]
+    ac = "".join(t[0] for t in toks if t)
+    return ac.upper()
+
+def jaccard(a: List[str], b: List[str]) -> float:
+    sa, sb = set(a), set(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+def fuzzy_ratio(a: str, b: str) -> float:
+    return SequenceMatcher(None, normalize_text(a), normalize_text(b)).ratio()
+
+def token_overlap_score(qtoks: List[str], ttoks: List[str]) -> float:
+    if not qtoks or not ttoks:
+        return 0.0
+    inter = sum(1 for t in qtoks if t in ttoks)
+    return inter / len(qtoks)
+
+def hybrid_score(query: str, title: str) -> float:
+    qn, tn = normalize_text(query), normalize_text(title)
+    qt, tt = tokens(qn), tokens(tn)
+
+    base = fuzzy_ratio(qn, tn)                       # 0..1
+    jac  = jaccard(qt, tt)                           # 0..1
+    cov  = token_overlap_score(qt, tt)               # 0..1
+    acr_q = make_acronym(query)
+    acr_t = make_acronym(title)
+    acr = 1.0 if acr_q and acr_q == acr_t else 0.0
+
+    # weighted blend (+ small boost for perfect acronym match)
+    score = 0.55 * base + 0.25 * jac + 0.20 * cov + 0.10 * acr
+    return max(0.0, min(1.0, score))
+
+def generate_query_variants(q: str) -> List[str]:
+    qn = normalize_text(q)
+    toks = qn.split()
+
+    # Base variants
+    variants = {q.strip(), qn}
+
+    # Remove leading "journal of ..." / "the ..." wrappers
+    trimmed = re.sub(r"^(the|journal|journal of)\s+", "", qn)
+    if trimmed != qn:
+        variants.add(trimmed)
+
+    # AND/& toggles already normalized; but try compact w/o stopwords
+    core = " ".join([t for t in toks if t not in STOPWORDS])
+    if core and core != qn:
+        variants.add(core)
+
+    # Abbreviation expansions (single-word expansions like 'plos', 'int')
+    expanded_tokens = []
+    for t in toks:
+        expanded_tokens.extend(expand_abbrev(t))
+    expanded = " ".join(expanded_tokens)
+    if expanded and expanded != qn:
+        variants.add(expanded)
+
+    # If the query looks like an acronym (>=3 letters all caps), also keep it
+    raw_acr = "".join(ch for ch in q if ch.isalpha())
+    if raw_acr.isupper() and len(raw_acr) >= 3:
+        variants.add(raw_acr)
+
+    # Try removing hyphenated or extra qualifiers like "international", "letters", "reports"
+    drop_set = {"international", "intl", "letters", "reports", "annals", "bulletin", "transactions", "reviews", "journal"}
+    skim = " ".join([t for t in toks if t not in drop_set])
+    if skim and skim != qn:
+        variants.add(skim)
+
+    # Deduplicate, keep reasonable lengths
+    out = [v for v in variants if len(v) >= 2]
+    # Sort by descending length to try more specific first
+    out.sort(key=lambda s: (-len(s), s))
+    return out[:8]  # cap to keep network calls bounded
+
+# ---------------------------
+# SCImago scraping
+# ---------------------------
 
 @st.cache_data(ttl=60 * 60)
 def sjr_search(query: str) -> List[Dict]:
@@ -73,7 +211,6 @@ def sjr_search(query: str) -> List[Dict]:
 
         title = a.get_text(strip=True)
         url = _absolute_url(a.get("href"))
-        # Optional hints we can pick up if present
         hint = " ".join(c.get_text(" ", strip=True) for c in cols[1:]) if len(cols) > 1 else ""
 
         candidates.append({
@@ -84,69 +221,73 @@ def sjr_search(query: str) -> List[Dict]:
 
     return candidates
 
+@st.cache_data(ttl=60 * 60)
+def sjr_search_intelligent(query: str) -> List[Dict]:
+    """
+    Run multiple variant queries, pool results, then rank by hybrid score.
+    Adds 'score' and 'acronym' fields to each candidate.
+    """
+    seen: Dict[str, Dict] = {}  # key by URL (stable) or title if URL missing
+    variants = generate_query_variants(query)
+
+    for v in variants:
+        try:
+            res = sjr_search(v)
+        except Exception:
+            res = []
+        for r in res:
+            key = r.get("url") or r.get("title")
+            if key not in seen:
+                seen[key] = r
+
+    # Score and sort
+    ranked = []
+    for r in seen.values():
+        s = hybrid_score(query, r["title"])
+        ranked.append({
+            **r,
+            "score": round(float(s), 4),
+            "acronym": make_acronym(r["title"])
+        })
+
+    ranked.sort(key=lambda x: x["score"], reverse=True)
+    return ranked
+
 def _grab_first_number(pattern: str, text: str) -> Optional[str]:
     m = re.search(pattern, text, flags=re.I)
     if m:
-        # prefer last group with a number
         groups = [g for g in m.groups() if g is not None]
         if groups:
             return groups[-1]
     return None
 
 def _parse_highest_percentile_from_text(txt: str) -> Optional[int]:
-    """
-    Heuristic: SCImago category badges show like 'Q1 (97)' where 97 is the percentile.
-    We try to find numbers in parentheses following 'Q[1-4]'.
-    Fallback: look for 'percentile' phrases.
-    """
-    # Q1 (97) style
     nums = [int(n) for n in re.findall(r"Q[1-4]\s*\(\s*(\d{1,3})\s*\)", txt, flags=re.I) if 0 <= int(n) <= 100]
     if nums:
         return max(nums)
-
-    # "... 97 percentile" style
     nums = [int(n) for n in re.findall(r"(\d{1,3})\s*(?:st|nd|rd|th)?\s*percentile", txt, flags=re.I) if 0 <= int(n) <= 100]
     if nums:
         return max(nums)
-
     return None
 
 def _parse_categories(soup: BeautifulSoup) -> List[str]:
-    """
-    Try to extract the list of subject areas / categories shown on SJR page.
-    We'll gather any sensible table with category-like strings.
-    """
     cats = set()
     for table in soup.find_all("table"):
-        # Heuristic: capture rows containing Qx or "Category"
         if "category" in (table.get_text(" ", strip=True).lower()):
             for row in table.find_all("tr"):
                 tds = [td.get_text(" ", strip=True) for td in row.find_all("td")]
                 for td in tds:
-                    # Simple filter to avoid numeric-only cells
                     if len(td) > 3 and not re.fullmatch(r"[\d\W]+", td):
                         cats.add(td)
-    # Fallback: scrape badges/labels
     if not cats:
         for span in soup.find_all(["span", "a", "div"]):
             t = span.get_text(" ", strip=True)
             if "Q1" in t or "Q2" in t or "Q3" in t or "Q4" in t:
-                # Often category name is nearby; include this text anyway
                 cats.add(t)
     return sorted(cats)
 
 @st.cache_data(ttl=60 * 60)
 def sjr_fetch_details(url: str) -> Dict:
-    """
-    Fetch a journal's detail page on SCImago and parse:
-    - official name
-    - H-index
-    - SJR (used here as public 'impact' proxy)
-    - Best quartile / Highest percentile
-    - Publisher, Country, ISSN
-    - Categories
-    - Links
-    """
     html = http_get(url)
     soup = BeautifulSoup(html, "lxml")
     page_text = soup.get_text(" ", strip=True)
@@ -173,17 +314,14 @@ def sjr_fetch_details(url: str) -> Dict:
         highest_pct = int(highest_pct)
 
     # Publisher / Country / ISSN (heuristics)
-    publisher = _grab_first_number(r"Publisher\s*:?\s*(.+?)\s{2,}", page_text)  # not great; fallback below
+    publisher = _grab_first_number(r"Publisher\s*:?\s*(.+?)\s{2,}", page_text)
     country = _grab_first_number(r"Country\s*:?\s*([A-Za-z \-]+)", page_text)
-    # Try to capture ISSNs (ISSN, ISSN (Print), ISSN (Online))
     issns = re.findall(r"ISSN[^0-9]*([0-9]{4}\-?[0-9Xx]{4})", page_text)
     issns = list(dict.fromkeys(issns)) if issns else []
 
-    # If publisher regex failed, try pulling from labeled spans
     if not publisher:
         for b in soup.find_all(["b", "strong"]):
             if "Publisher" in b.get_text():
-                # next sibling text
                 t = b.parent.get_text(" ", strip=True)
                 m = re.search(r"Publisher\s*:?\s*(.*)$", t, flags=re.I)
                 if m:
@@ -192,20 +330,16 @@ def sjr_fetch_details(url: str) -> Dict:
 
     categories = _parse_categories(soup)
 
-    # Links: SJR page itself + any homepage link they may show
     links = {"scimago_page": url}
-    # Try to find a Homepage anchor
     for a in soup.find_all("a"):
         text = a.get_text(" ", strip=True).lower()
         if "homepage" in text or "journal homepage" in text:
             links["journal_homepage"] = a.get("href")
             break
 
-    # Compose result
     detail = {
         "journal_name": name,
         "h_index": int(h_index) if h_index else None,
-        # Treat SJR as an "impact (SJR)" proxy; we will show it in the IF column with a label
         "sjr": float(sjr_val) if sjr_val else None,
         "best_quartile": best_quartile,
         "highest_percentile": highest_pct,
@@ -250,17 +384,23 @@ st.caption(
 )
 
 with st.sidebar:
+    st.header("Search settings")
+    mode = st.radio("Search mode", ["Word-Intelligence (recommended)", "Default"], index=0)
+    auto_fetch = st.toggle("Auto-fetch top match if confidence ≥ 0.85", value=True)
+    show_variants = st.toggle("Show query variants & debug", value=False)
+
+    st.markdown("---")
     st.header("About")
     st.write(
         "- Data source: **SCImago Journal & Country Rank (SJR)** public pages.\n"
         "- H-index and category percentiles are parsed from the journal’s SJR page.\n"
-        "- 'Impact factor' shown here = **SJR proxy**, *not* Clarivate JIF."
+        "- 'Impact factor' shown here = **SJR** proxy, *not* Clarivate JIF."
     )
     st.markdown("---")
-    st.write("Tip: If the journal has many similar names, pick the exact one from the results list.")
+    st.write("Tip: If the journal has many similar names, pick the exact one from the list.")
 
-query = st.text_input("🔎 Enter journal name", placeholder="e.g., Nature, PLoS ONE, Malaria Journal")
-max_candidates = st.slider("Max search results to list", 1, 30, 10)
+query = st.text_input("🔎 Enter journal name (ISSN or title)", placeholder="e.g., Nature, PLOS ONE, Malaria Journal")
+max_candidates = st.slider("Max results to list", 1, 50, 12)
 
 search_col1, search_col2 = st.columns([1, 3])
 with search_col1:
@@ -272,45 +412,101 @@ results_df = pd.DataFrame()
 selected = None
 
 if do_search and query.strip():
-    with st.spinner("Searching SCImago…"):
-        try:
-            candidates = sjr_search(query.strip())[:max_candidates]
-        except Exception as e:
-            st.error(f"Search failed: {e}")
-            candidates = []
+    try:
+        if mode.startswith("Word-Intelligence"):
+            variants = generate_query_variants(query)
+            if show_variants:
+                with st.expander("Query variants"):
+                    st.write(variants)
 
-    if not candidates:
-        st.warning("No results found. Try a different or shorter name.")
-    else:
-        # Show as a selectable table
-        cdf = pd.DataFrame([{"Title": c["title"], "Hint": c["hint"], "URL": c["url"]} for c in candidates])
-        st.subheader("Search results")
-        st.dataframe(cdf.drop(columns=["URL"]), use_container_width=True)
+            with st.spinner("Searching SCImago with intelligent variants…"):
+                ranked = sjr_search_intelligent(query)
+            # Limit and display
+            if not ranked:
+                st.warning("No results found. Try a different or shorter name.")
+            else:
+                # “Did you mean…?”
+                top = ranked[0]
+                if top["score"] >= 0.75:
+                    st.info(f"**Did you mean:** {top['title']}  \nConfidence: {top['score']:.2%}")
 
-        pick = st.selectbox(
-            "Choose a journal to fetch metrics",
-            options=list(range(len(candidates))),
-            format_func=lambda i: candidates[i]["title"]
-        )
-        chosen = candidates[pick]
+                cdf = pd.DataFrame([
+                    {
+                        "Title": r["title"],
+                        "Hint": r.get("hint", ""),
+                        "Confidence": f"{r['score']:.2%}",
+                        "Acronym": r.get("acronym", ""),
+                        "URL": r["url"]
+                    }
+                    for r in ranked[:max_candidates]
+                ])
+                st.subheader("Search results")
+                st.dataframe(cdf.drop(columns=["URL"]), use_container_width=True)
 
-        fetch = st.button("Fetch metrics for selected journal")
-        if fetch:
-            with st.spinner(f"Fetching metrics for **{chosen['title']}**…"):
-                try:
-                    detail = sjr_fetch_details(chosen["url"])
-                    row = row_from_detail(detail)
-                    results_df = pd.DataFrame([row])
-                except Exception as e:
-                    st.error(f"Failed to fetch/parse details: {e}")
+                pick = st.selectbox(
+                    "Choose a journal to fetch metrics",
+                    options=list(range(min(len(ranked), max_candidates))),
+                    format_func=lambda i: ranked[i]["title"]
+                )
+                chosen = ranked[pick]
+
+                should_fetch = st.button("Fetch metrics for selected journal")
+                # Auto-fetch if very confident
+                if auto_fetch and ranked and ranked[0]["score"] >= 0.85:
+                    chosen = ranked[0]
+                    should_fetch = True
+                    st.caption("Auto-fetching top match (confidence ≥ 0.85).")
+
+                if should_fetch:
+                    with st.spinner(f"Fetching metrics for **{chosen['title']}**…"):
+                        try:
+                            detail = sjr_fetch_details(chosen["url"])
+                            row = row_from_detail(detail)
+                            results_df = pd.DataFrame([row])
+                        except Exception as e:
+                            st.error(f"Failed to fetch/parse details: {e}")
+
+        else:
+            # Default mode (single query, no intelligence)
+            with st.spinner("Searching SCImago…"):
+                candidates = sjr_search(query.strip())[:max_candidates]
+
+            if not candidates:
+                st.warning("No results found. Try a different or shorter name.")
+            else:
+                cdf = pd.DataFrame([{"Title": c["title"], "Hint": c["hint"], "URL": c["url"]} for c in candidates])
+                st.subheader("Search results")
+                st.dataframe(cdf.drop(columns=["URL"]), use_container_width=True)
+
+                pick = st.selectbox(
+                    "Choose a journal to fetch metrics",
+                    options=list(range(len(candidates))),
+                    format_func=lambda i: candidates[i]["title"]
+                )
+                chosen = candidates[pick]
+
+                fetch = st.button("Fetch metrics for selected journal")
+                if fetch:
+                    with st.spinner(f"Fetching metrics for **{chosen['title']}**…"):
+                        try:
+                            detail = sjr_fetch_details(chosen["url"])
+                            row = row_from_detail(detail)
+                            results_df = pd.DataFrame([row])
+                        except Exception as e:
+                            st.error(f"Failed to fetch/parse details: {e}")
+
+    except requests.HTTPError as e:
+        st.error(f"HTTP error: {e}")
+    except requests.RequestException as e:
+        st.error(f"Network error: {e}")
+    except Exception as e:
+        st.error(f"Unexpected error: {e}")
 
 if not results_df.empty:
     st.subheader("Results")
-    # Hide the raw Links column in the visible table
     show_df = results_df.drop(columns=["Links"], errors="ignore")
     st.dataframe(show_df, use_container_width=True)
 
-    # Download as CSV/JSON
     c1, c2 = st.columns(2)
     with c1:
         st.download_button(
@@ -327,7 +523,6 @@ if not results_df.empty:
             mime="application/json"
         )
 
-    # Quick links
     if "Links" in results_df.columns:
         try:
             links = json.loads(results_df.iloc[0]["Links"])
