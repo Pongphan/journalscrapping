@@ -1,9 +1,8 @@
 import re
 import json
-import math
 import unicodedata
 import urllib.parse as ul
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from difflib import SequenceMatcher
 
 import requests
@@ -27,7 +26,7 @@ st.set_page_config(
 )
 
 # ---------------------------
-# Helpers (HTTP)
+# HTTP helpers
 # ---------------------------
 
 @st.cache_data(ttl=60 * 60)
@@ -37,27 +36,109 @@ def http_get(url: str, params: Optional[dict] = None) -> str:
     r.raise_for_status()
     return r.text
 
-def _find_results_table(soup: BeautifulSoup):
-    # Try to identify the results table that has a "Title" column
-    for table in soup.find_all("table"):
-        ths = [th.get_text(strip=True).lower() for th in table.find_all("th")]
-        if any("title" in t for t in ths):
-            return table
-    return None
 
 def _absolute_url(href: str) -> str:
     if href.startswith("http"):
         return href
     return BASE + "/" + href.lstrip("/")
 
+
 # ---------------------------
-# Text intelligence helpers
+# SJR results parsing (tolerant)
+# ---------------------------
+
+def _find_results_table(soup: BeautifulSoup):
+    """Look for any table that plausibly contains results (title/journal/source/publication)."""
+    candidates = []
+    for table in soup.find_all("table"):
+        ths = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+        header_blob = " ".join(ths)
+        if any(k in header_blob for k in ["title", "journal", "source", "publication"]):
+            candidates.append(table)
+    return candidates[0] if candidates else None
+
+
+def _extract_candidates_from_any_markup(soup: BeautifulSoup) -> List[Dict]:
+    """Fallback: scrape journal links even without a recognizable table."""
+    items: List[Dict] = []
+
+    # A) links that point to a specific journal SID page
+    for a in soup.select('a[href*="journalsearch.php"]'):
+        href = a.get("href") or ""
+        text = a.get_text(" ", strip=True)
+        if "tip=sid" in href and text:
+            items.append({
+                "title": text,
+                "url": _absolute_url(href),
+                "hint": ""
+            })
+
+    # B) any table rows with a link in first cell
+    if not items:
+        for table in soup.find_all("table"):
+            for row in table.find_all("tr"):
+                a = row.find("a")
+                if not a or not a.get("href"):
+                    continue
+                title = a.get_text(" ", strip=True)
+                href = a.get("href")
+                if not title or not href:
+                    continue
+                tds = row.find_all("td")
+                hint = " ".join(td.get_text(" ", strip=True) for td in tds[1:]) if len(tds) > 1 else ""
+                items.append({
+                    "title": title,
+                    "url": _absolute_url(href),
+                    "hint": hint
+                })
+
+    # de-dupe by URL
+    seen = set()
+    uniq = []
+    for it in items:
+        key = it["url"]
+        if key not in seen:
+            seen.add(key)
+            uniq.append(it)
+    return uniq
+
+
+@st.cache_data(ttl=60 * 60)
+def sjr_search(query: str) -> List[Dict]:
+    """Search SCImago for journals by name/ISSN and return candidate rows."""
+    html = http_get(SEARCH_URL.format(query=ul.quote_plus(query)))
+    soup = BeautifulSoup(html, "lxml")
+
+    candidates: List[Dict] = []
+
+    table = _find_results_table(soup)
+    if table:
+        for row in table.select("tr")[1:]:
+            cols = row.find_all("td")
+            if not cols:
+                continue
+            a = cols[0].find("a")
+            if not a or not a.get("href"):
+                continue
+            title = a.get_text(strip=True)
+            url = _absolute_url(a.get("href"))
+            hint = " ".join(c.get_text(" ", strip=True) for c in cols[1:]) if len(cols) > 1 else ""
+            candidates.append({"title": title, "url": url, "hint": hint})
+
+    if not candidates:
+        candidates = _extract_candidates_from_any_markup(soup)
+
+    return candidates
+
+
+# ---------------------------
+# Word‑intelligence helpers
 # ---------------------------
 
 STOPWORDS = {
-    "the","of","and","for","in","on","to","a","an","at","by",
-    "journal","j","rev","reviews","annals","letters","bulletin",
-    "transactions","archives","acta"
+    "the", "of", "and", "for", "in", "on", "to", "a", "an", "at", "by",
+    "journal", "j", "rev", "reviews", "annals", "letters", "bulletin",
+    "transactions", "archives", "acta"
 }
 
 ABBREV_EXPAND = {
@@ -77,11 +158,12 @@ ABBREV_EXPAND = {
     "environ": "environmental",
     "technol": "technology",
     "techn": "technology",
-    # well-known orgs
+    # orgs
     "ieee": "institute of electrical and electronics engineers",
     "acm": "association for computing machinery",
     "plos": "public library of science",
 }
+
 
 def normalize_text(s: str) -> str:
     if not s:
@@ -95,20 +177,23 @@ def normalize_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
+
 def tokens(text: str) -> List[str]:
     return [t for t in normalize_text(text).split() if t]
 
+
 def expand_abbrev(tok: str) -> List[str]:
-    # return [original or expanded]
     out = [tok]
     if tok in ABBREV_EXPAND:
         out.append(ABBREV_EXPAND[tok])
     return out
 
+
 def make_acronym(text: str) -> str:
     toks = [t for t in tokens(text) if t not in STOPWORDS]
     ac = "".join(t[0] for t in toks if t)
     return ac.upper()
+
 
 def jaccard(a: List[str], b: List[str]) -> float:
     sa, sb = set(a), set(b)
@@ -116,8 +201,10 @@ def jaccard(a: List[str], b: List[str]) -> float:
         return 0.0
     return len(sa & sb) / len(sa | sb)
 
+
 def fuzzy_ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, normalize_text(a), normalize_text(b)).ratio()
+
 
 def token_overlap_score(qtoks: List[str], ttoks: List[str]) -> float:
     if not qtoks or not ttoks:
@@ -125,39 +212,39 @@ def token_overlap_score(qtoks: List[str], ttoks: List[str]) -> float:
     inter = sum(1 for t in qtoks if t in ttoks)
     return inter / len(qtoks)
 
+
 def hybrid_score(query: str, title: str) -> float:
     qn, tn = normalize_text(query), normalize_text(title)
     qt, tt = tokens(qn), tokens(tn)
 
-    base = fuzzy_ratio(qn, tn)                       # 0..1
-    jac  = jaccard(qt, tt)                           # 0..1
-    cov  = token_overlap_score(qt, tt)               # 0..1
+    base = fuzzy_ratio(qn, tn)                    # 0..1
+    jac = jaccard(qt, tt)                         # 0..1
+    cov = token_overlap_score(qt, tt)             # 0..1
     acr_q = make_acronym(query)
     acr_t = make_acronym(title)
     acr = 1.0 if acr_q and acr_q == acr_t else 0.0
 
-    # weighted blend (+ small boost for perfect acronym match)
     score = 0.55 * base + 0.25 * jac + 0.20 * cov + 0.10 * acr
     return max(0.0, min(1.0, score))
+
 
 def generate_query_variants(q: str) -> List[str]:
     qn = normalize_text(q)
     toks = qn.split()
 
-    # Base variants
     variants = {q.strip(), qn}
 
-    # Remove leading "journal of ..." / "the ..." wrappers
+    # remove wrappers
     trimmed = re.sub(r"^(the|journal|journal of)\s+", "", qn)
     if trimmed != qn:
         variants.add(trimmed)
 
-    # AND/& toggles already normalized; but try compact w/o stopwords
+    # stopword-trimmed core
     core = " ".join([t for t in toks if t not in STOPWORDS])
     if core and core != qn:
         variants.add(core)
 
-    # Abbreviation expansions (single-word expansions like 'plos', 'int')
+    # abbreviation expansions
     expanded_tokens = []
     for t in toks:
         expanded_tokens.extend(expand_abbrev(t))
@@ -165,71 +252,65 @@ def generate_query_variants(q: str) -> List[str]:
     if expanded and expanded != qn:
         variants.add(expanded)
 
-    # If the query looks like an acronym (>=3 letters all caps), also keep it
+    # keep raw acronym if query is all-caps letters
     raw_acr = "".join(ch for ch in q if ch.isalpha())
     if raw_acr.isupper() and len(raw_acr) >= 3:
         variants.add(raw_acr)
 
-    # Try removing hyphenated or extra qualifiers like "international", "letters", "reports"
+    # skim generic qualifiers
     drop_set = {"international", "intl", "letters", "reports", "annals", "bulletin", "transactions", "reviews", "journal"}
     skim = " ".join([t for t in toks if t not in drop_set])
     if skim and skim != qn:
         variants.add(skim)
 
-    # Deduplicate, keep reasonable lengths
     out = [v for v in variants if len(v) >= 2]
-    # Sort by descending length to try more specific first
     out.sort(key=lambda s: (-len(s), s))
-    return out[:8]  # cap to keep network calls bounded
+    return out[:8]
+
 
 # ---------------------------
-# SCImago scraping
+# Crossref fallback → ISSN → SJR
 # ---------------------------
 
 @st.cache_data(ttl=60 * 60)
-def sjr_search(query: str) -> List[Dict]:
-    """
-    Search SCImago for journals by name. Returns a list of candidates with title and detail URL.
-    """
-    html = http_get(SEARCH_URL.format(query=ul.quote_plus(query)))
-    soup = BeautifulSoup(html, "lxml")
-
-    table = _find_results_table(soup)
-    if table is None:
+def crossref_journal_lookup(query: str, rows: int = 8) -> List[Dict]:
+    """Query Crossref for journals; return title + ISSN list to retry on SJR."""
+    url = f"https://api.crossref.org/journals?query.title={ul.quote_plus(query)}&rows={rows}"
+    try:
+        r = requests.get(url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=20)
+        r.raise_for_status()
+        items = r.json().get("message", {}).get("items", [])
+    except Exception:
         return []
 
-    candidates = []
-    for row in table.select("tr")[1:]:
-        cols = row.find_all("td")
-        if not cols:
-            continue
+    out = []
+    for it in items:
+        title = it.get("title") or it.get("publisher") or ""
+        issns = it.get("ISSN", []) or []
+        out.append({"title": title, "issns": issns})
+    return out
 
-        # First cell should hold the Title with a link
-        a = cols[0].find("a")
-        if not a or not a.get("href"):
-            continue
 
-        title = a.get_text(strip=True)
-        url = _absolute_url(a.get("href"))
-        hint = " ".join(c.get_text(" ", strip=True) for c in cols[1:]) if len(cols) > 1 else ""
+def _try_sjr_by_issn_list(issns: List[str]) -> List[Dict]:
+    hits: List[Dict] = []
+    for issn in issns:
+        try:
+            res = sjr_search(issn)
+        except Exception:
+            res = []
+        for r in res:
+            if r not in hits:
+                hits.append(r)
+    return hits
 
-        candidates.append({
-            "title": title,
-            "url": url,
-            "hint": hint
-        })
-
-    return candidates
 
 @st.cache_data(ttl=60 * 60)
 def sjr_search_intelligent(query: str) -> List[Dict]:
-    """
-    Run multiple variant queries, pool results, then rank by hybrid score.
-    Adds 'score' and 'acronym' fields to each candidate.
-    """
-    seen: Dict[str, Dict] = {}  # key by URL (stable) or title if URL missing
+    """Run multiple query variants; if none, use Crossref→ISSN as a fallback. Score & sort results."""
+    seen: Dict[str, Dict] = {}
     variants = generate_query_variants(query)
 
+    # 1) SJR with variants
     for v in variants:
         try:
             res = sjr_search(v)
@@ -240,18 +321,31 @@ def sjr_search_intelligent(query: str) -> List[Dict]:
             if key not in seen:
                 seen[key] = r
 
-    # Score and sort
+    # 2) Crossref fallback
+    if not seen:
+        xrefs = crossref_journal_lookup(query, rows=8)
+        issn_pool: List[str] = []
+        for x in xrefs:
+            issn_pool.extend(x.get("issns", []))
+        issn_pool = list(dict.fromkeys(issn_pool))
+        if issn_pool:
+            for r in _try_sjr_by_issn_list(issn_pool):
+                key = r.get("url") or r.get("title")
+                if key not in seen:
+                    seen[key] = r
+
+    # score & sort
     ranked = []
     for r in seen.values():
         s = hybrid_score(query, r["title"])
-        ranked.append({
-            **r,
-            "score": round(float(s), 4),
-            "acronym": make_acronym(r["title"])
-        })
-
+        ranked.append({**r, "score": round(float(s), 4), "acronym": make_acronym(r["title"])})
     ranked.sort(key=lambda x: x["score"], reverse=True)
     return ranked
+
+
+# ---------------------------
+# Detail page parsing
+# ---------------------------
 
 def _grab_first_number(pattern: str, text: str) -> Optional[str]:
     m = re.search(pattern, text, flags=re.I)
@@ -261,6 +355,7 @@ def _grab_first_number(pattern: str, text: str) -> Optional[str]:
             return groups[-1]
     return None
 
+
 def _parse_highest_percentile_from_text(txt: str) -> Optional[int]:
     nums = [int(n) for n in re.findall(r"Q[1-4]\s*\(\s*(\d{1,3})\s*\)", txt, flags=re.I) if 0 <= int(n) <= 100]
     if nums:
@@ -269,6 +364,7 @@ def _parse_highest_percentile_from_text(txt: str) -> Optional[int]:
     if nums:
         return max(nums)
     return None
+
 
 def _parse_categories(soup: BeautifulSoup) -> List[str]:
     cats = set()
@@ -282,9 +378,10 @@ def _parse_categories(soup: BeautifulSoup) -> List[str]:
     if not cats:
         for span in soup.find_all(["span", "a", "div"]):
             t = span.get_text(" ", strip=True)
-            if "Q1" in t or "Q2" in t or "Q3" in t or "Q4" in t:
+            if any(q in t for q in ["Q1", "Q2", "Q3", "Q4"]):
                 cats.add(t)
     return sorted(cats)
+
 
 @st.cache_data(ttl=60 * 60)
 def sjr_fetch_details(url: str) -> Dict:
@@ -313,7 +410,7 @@ def sjr_fetch_details(url: str) -> Dict:
     if highest_pct is not None:
         highest_pct = int(highest_pct)
 
-    # Publisher / Country / ISSN (heuristics)
+    # Publisher / Country / ISSN
     publisher = _grab_first_number(r"Publisher\s*:?\s*(.+?)\s{2,}", page_text)
     country = _grab_first_number(r"Country\s*:?\s*([A-Za-z \-]+)", page_text)
     issns = re.findall(r"ISSN[^0-9]*([0-9]{4}\-?[0-9Xx]{4})", page_text)
@@ -351,6 +448,7 @@ def sjr_fetch_details(url: str) -> Dict:
     }
     return detail
 
+
 def row_from_detail(d: Dict) -> Dict:
     impact_str = "N/A"
     if d.get("sjr") is not None:
@@ -374,9 +472,11 @@ def row_from_detail(d: Dict) -> Dict:
         "Links": json.dumps(d.get("links") or {})  # keep raw dict for download; hidden in table
     }
 
+
 # ---------------------------
 # UI
 # ---------------------------
+
 st.title("📚 Journal Metrics Finder")
 st.caption(
     "Search a publication journal by name and view **Highest percentile (SJR)**, **Impact (SJR proxy)**, **H-index**, and details. "
@@ -409,7 +509,6 @@ with search_col2:
     export_btn = st.empty()
 
 results_df = pd.DataFrame()
-selected = None
 
 if do_search and query.strip():
     try:
@@ -421,11 +520,10 @@ if do_search and query.strip():
 
             with st.spinner("Searching SCImago with intelligent variants…"):
                 ranked = sjr_search_intelligent(query)
-            # Limit and display
+
             if not ranked:
                 st.warning("No results found. Try a different or shorter name.")
             else:
-                # “Did you mean…?”
                 top = ranked[0]
                 if top["score"] >= 0.75:
                     st.info(f"**Did you mean:** {top['title']}  \nConfidence: {top['score']:.2%}")
@@ -436,7 +534,7 @@ if do_search and query.strip():
                         "Hint": r.get("hint", ""),
                         "Confidence": f"{r['score']:.2%}",
                         "Acronym": r.get("acronym", ""),
-                        "URL": r["url"]
+                        "URL": r["url"],
                     }
                     for r in ranked[:max_candidates]
                 ])
@@ -446,12 +544,11 @@ if do_search and query.strip():
                 pick = st.selectbox(
                     "Choose a journal to fetch metrics",
                     options=list(range(min(len(ranked), max_candidates))),
-                    format_func=lambda i: ranked[i]["title"]
+                    format_func=lambda i: ranked[i]["title"],
                 )
                 chosen = ranked[pick]
 
                 should_fetch = st.button("Fetch metrics for selected journal")
-                # Auto-fetch if very confident
                 if auto_fetch and ranked and ranked[0]["score"] >= 0.85:
                     chosen = ranked[0]
                     should_fetch = True
@@ -465,23 +562,21 @@ if do_search and query.strip():
                             results_df = pd.DataFrame([row])
                         except Exception as e:
                             st.error(f"Failed to fetch/parse details: {e}")
-
         else:
-            # Default mode (single query, no intelligence)
             with st.spinner("Searching SCImago…"):
                 candidates = sjr_search(query.strip())[:max_candidates]
 
             if not candidates:
                 st.warning("No results found. Try a different or shorter name.")
             else:
-                cdf = pd.DataFrame([{"Title": c["title"], "Hint": c["hint"], "URL": c["url"]} for c in candidates])
+                cdf = pd.DataFrame([{ "Title": c["title"], "Hint": c["hint"], "URL": c["url"] } for c in candidates])
                 st.subheader("Search results")
                 st.dataframe(cdf.drop(columns=["URL"]), use_container_width=True)
 
                 pick = st.selectbox(
                     "Choose a journal to fetch metrics",
                     options=list(range(len(candidates))),
-                    format_func=lambda i: candidates[i]["title"]
+                    format_func=lambda i: candidates[i]["title"],
                 )
                 chosen = candidates[pick]
 
@@ -494,13 +589,13 @@ if do_search and query.strip():
                             results_df = pd.DataFrame([row])
                         except Exception as e:
                             st.error(f"Failed to fetch/parse details: {e}")
-
     except requests.HTTPError as e:
         st.error(f"HTTP error: {e}")
     except requests.RequestException as e:
         st.error(f"Network error: {e}")
     except Exception as e:
         st.error(f"Unexpected error: {e}")
+
 
 if not results_df.empty:
     st.subheader("Results")
@@ -513,23 +608,23 @@ if not results_df.empty:
             "⬇️ Download CSV",
             data=show_df.to_csv(index=False).encode("utf-8"),
             file_name="journal_metrics.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
     with c2:
         st.download_button(
             "⬇️ Download JSON",
             data=results_df.to_json(orient="records", force_ascii=False, indent=2),
             file_name="journal_metrics.json",
-            mime="application/json"
+            mime="application/json",
         )
 
     if "Links" in results_df.columns:
         try:
-            links = json.loads(results_df.iloc[0]["Links"])
+            links = json.loads(results_df.iloc[0]["Links"]) or {}
             st.markdown("**Links**:")
-            if "scimago_page" in links:
+            if links.get("scimago_page"):
                 st.markdown(f"- SJR page: {links['scimago_page']}")
-            if "journal_homepage" in links:
+            if links.get("journal_homepage"):
                 st.markdown(f"- Journal homepage: {links['journal_homepage']}")
         except Exception:
             pass
