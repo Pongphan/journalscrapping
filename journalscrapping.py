@@ -634,3 +634,4 @@ st.caption(
     "Educational use only. Respect site Terms of Service. For official Journal Impact Factor (JIF), "
     "please consult **Journal Citation Reports (Clarivate)**."
 )
+
